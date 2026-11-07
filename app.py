@@ -46,15 +46,24 @@ with tab1:
             # поле S_ф — только для звезды с нулём
             show_phi = (scheme == "Звезда с нулём")
 
+                      # ---- Хранилище ВСЕГДА содержит все колонки ----
+            ALL_COLS = ["Прибор", "S_ab", "S_bc", "S_ca", "S_ф"]
             if f"df_{i}" not in st.session_state:
-                st.session_state[f"df_{i}"] = pd.DataFrame([
-                    {"Прибор": "Пример", "S_ab": 0.0, "S_bc": 0.0, "S_ca": 0.0, "S_ф": 0.0}
-                ])
+                st.session_state[f"df_{i}"] = pd.DataFrame(
+                    [{c: ("" if c == "Прибор" else 0.0) for c in ALL_COLS}]
+                )
+            stored = st.session_state[f"df_{i}"]
+            # Гарантируем наличие всех колонок
+            for c in ALL_COLS:
+                if c not in stored.columns:
+                    stored[c] = "" if c == "Прибор" else 0.0
 
-            cols = ["Прибор", "S_ab", "S_bc", "S_ca"] + (["S_ф"] if show_phi else [])
-            df = st.session_state[f"df_{i}"][cols]
+            # ---- Для отображения — только видимые колонки ----
+            visible = ["Прибор", "S_ab", "S_bc", "S_ca"] + (["S_ф"] if show_phi else [])
+            display_df = stored[visible].copy()
+
             edited = st.data_editor(
-                df, num_rows="dynamic", key=f"de_{i}",
+                display_df, num_rows="dynamic", key=f"de_{i}_{'phi' if show_phi else 'nophi'}",
                 column_config={
                     "Прибор": st.column_config.TextColumn("Прибор"),
                     "S_ab": st.column_config.NumberColumn("S_ab (В·А)", min_value=0.0, step=0.01, format="%.5f"),
@@ -63,7 +72,9 @@ with tab1:
                     **({"S_ф": st.column_config.NumberColumn("S_ф (В·А)", min_value=0.0, step=0.01, format="%.5f")} if show_phi else {}),
                 },
             )
-            st.session_state[f"df_{i}"] = edited
+            # Сливаем видимые колонки обратно, остальные (скрытые) не трогаем
+            stored[visible] = edited[visible].values
+            st.session_state[f"df_{i}"] = stored
 
             def _sum(col):
                 if col not in edited.columns: return 0.0
