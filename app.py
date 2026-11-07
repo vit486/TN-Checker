@@ -1,20 +1,17 @@
-# app.py
 import streamlit as st
-import json
-import math
 import pandas as pd
-from calculations.load import calculate_snf_3phase, calculate_snf_open_delta
+import math
+from calculations.load import calculate_snf_star, calculate_snf_delta, suggest_optimization
 from calculations.voltage_loss import calculate_resistance, calculate_current, calculate_du
-
-# --- Загрузка справочника (если файла нет — работаем без него) ---
-try:
-    with open('data/equipment.json', 'r', encoding='utf-8') as f:
-        equipment_db = json.load(f)
-except FileNotFoundError:
-    equipment_db = []
+from calculations.breakers import calculate_zk, calculate_ikz_min, check_breaker
+from reports.word_builder import build_report
 
 st.set_page_config(page_title="Проверка ТН по РД 34.35.305-79", layout="wide")
 st.title("Проверка ТН и вторичных цепей (РД 34.35.305-79)")
+
+# Инициализация состояния
+if "num_windings" not in st.session_state:
+    st.session_state.num_windings = 1
 
 tab1, tab2, tab3 = st.tabs(["Нагрузка ТН", "Потери напряжения", "Проверка автоматов"])
 
@@ -22,173 +19,225 @@ tab1, tab2, tab3 = st.tabs(["Нагрузка ТН", "Потери напряж�
 # ВКЛАДКА 1: НАГРУЗКА ТН
 # ============================================================
 with tab1:
-    st.header("1. Расчёт нагрузки наиболее загруженной фазы")
-    scheme = st.radio(
-        "Схема соединения обмоток ТН:",
-        ["Звезда (3-фазный)", "Открытый треугольник (2 ТН)"],
+    st.header("1. Расчёт нагрузки ТН")
+    
+    st.session_state.num_windings = st.number_input(
+        "Количество вторичных обмоток ТН (1-4):", min_value=1, max_value=4, value=st.session_state.num_windings
     )
 
-    st.subheader("Добавьте аппаратуру")
+    windings_data = []
+    
+    # Используем форму, чтобы избежать сброса при вводе
+    with st.form("load_form"):
+        for i in range(st.session_state.num_windings):
+            st.subheader(f"Обмотка {i+1}")
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                scheme = st.selectbox(
+                    f"Схема соединения (Обмотка {i+1})",
+                    ["Звезда с нулём", "Звезда без нуля", "Открытый треугольник"],
+                    key=f"scheme_{i}"
+                )
+            with col2:
+                rated_power = st.number_input(
+                    f"Номинальная мощность в классе точности, В·А (Обмотка {i+1})",
+                    min_value=10.0, value=50.0, step=10.0, format="%.2f", key=f"power_{i}"
+                )
 
-    # Инициализация состояния — DataFrame в session_state
-    if "loads_df" not in st.session_state:
-        st.session_state.loads_df = pd.DataFrame(
-            [
-                {
-                    "Прибор": "Счетчик",
-                    "Тип": "Междуфазная",
-                    "S_ab": 6.0,
-                    "S_bc": 6.0,
-                    "S_ca": 0.0,
-                    "S_a": 0.0,
-                    "S_b": 0.0,
-                    "S_c": 0.0,
-                }
-            ]
-        )
-
-    edited_df = st.data_editor(
-        st.session_state.loads_df,
-        num_rows="dynamic",
-        key="loads_editor",
-        column_config={
-            "Прибор": st.column_config.TextColumn("Название"),
-            "Тип": st.column_config.SelectboxColumn(
-                "Тип нагрузки", options=["Междуфазная", "Фазная"]
-            ),
-            "S_ab": st.column_config.NumberColumn("S_ab (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-            "S_bc": st.column_config.NumberColumn("S_bc (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-            "S_ca": st.column_config.NumberColumn("S_ca (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-            "S_a": st.column_config.NumberColumn("S_a (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-            "S_b": st.column_config.NumberColumn("S_b (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-            "S_c": st.column_config.NumberColumn("S_c (В·А)", min_value=0.0, step=0.1, format="%.2f"),
-        },
-    )
-    st.session_state.loads_df = edited_df
-
-    # Безопасное суммирование (None/NaN → 0)
-    def safe_sum(df, col):
-        if col not in df.columns:
-            return 0.0
-        return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
-
-    S_ab = safe_sum(edited_df, "S_ab")
-    S_bc = safe_sum(edited_df, "S_bc")
-    S_ca = safe_sum(edited_df, "S_ca")
-    S_a = safe_sum(edited_df, "S_a")
-    S_b = safe_sum(edited_df, "S_b")
-    S_c = safe_sum(edited_df, "S_c")
-    S_phi_max = max(S_a, S_b, S_c)
-
-    st.write(
-        f"Суммарные междуфазные нагрузки: S_ab={S_ab:.2f}, "
-        f"S_bc={S_bc:.2f}, S_ca={S_ca:.2f} В·А"
-    )
-    st.write(
-        f"Суммарные фазные нагрузки: S_a={S_a:.2f}, "
-        f"S_b={S_b:.2f}, S_c={S_c:.2f} В·А"
-    )
-
-    if scheme.startswith("Звезда"):
-        S_nf = calculate_snf_3phase(S_ab, S_bc, S_ca, S_phi_max)
-        st.metric("Нагрузка наиболее загруженной фазы (Sнф)", f"{S_nf:.1f} В·А")
-        st.info(
-            "Расчёт по РД (Пример 2, стр. 115). Сравните 3·Sнф с мощностью "
-            "ТН в классе точности."
-        )
-    else:
-        S_nf = calculate_snf_open_delta(S_ab, S_bc, S_ca)
-        st.metric("Нагрузка наиболее загруженного ТН (Sнф)", f"{S_nf:.1f} В·А")
-        st.info(
-            "Расчёт по РД (Пример 1, стр. 114). Сравните Sнф с мощностью "
-            "одного ТН в классе точности."
-        )
+            st.write("Введите нагрузки (В·А):")
+            c1, c2, c3, c4 = st.columns(4)
+            S_ab = c1.number_input(f"S_ab (Обмотка {i+1})", value=0.0, step=0.5, format="%.5f", key=f"Sab_{i}")
+            S_bc = c2.number_input(f"S_bc (Обмотка {i+1})", value=0.0, step=0.5, format="%.5f", key=f"Sbc_{i}")
+            S_ca = c3.number_input(f"S_ca (Обмотка {i+1})", value=0.0, step=0.5, format="%.5f", key=f"Sca_{i}")
+            
+            S_phi = 0.0
+            if scheme != "Открытый треугольник":
+                S_phi = c4.number_input(f"S_ф (Обмотка {i+1})", value=0.0, step=0.5, format="%.5f", key=f"Sphi_{i}")
+            else:
+                c4.write("S_ф не используется")
+            
+            windings_data.append({
+                "scheme": "star" if "Звезда" in scheme else "delta",
+                "scheme_name": scheme,
+                "rated_power": rated_power,
+                "S_ab": S_ab, "S_bc": S_bc, "S_ca": S_ca, "S_phi": S_phi
+            })
+            
+        submitted = st.form_submit_button("Рассчитать нагрузки")
+        
+    if submitted or "calc_results" in st.session_state:
+        # Сохраняем введённые данные в сессию
+        st.session_state.windings_data = windings_data
+        
+        st.write("---")
+        st.subheader("Результаты расчёта")
+        
+        results = []
+        for i, w in enumerate(windings_data):
+            if w["scheme"] == "star":
+                S_nf = calculate_snf_star(w["S_ab"], w["S_bc"], w["S_ca"], w["S_phi"])
+                total_load = 3 * S_nf
+            else:
+                S_nf = calculate_snf_delta(w["S_ab"], w["S_bc"], w["S_ca"])
+                total_load = S_nf
+                
+            is_overload = total_load > w["rated_power"]
+            
+            st.markdown(f"**Обмотка {i+1} ({w['scheme_name']})**")
+            st.write(f"Нагрузка наиболее загруженной фазы S_нф: **{S_nf:.2f} В·А**")
+            st.write(f"Расчётная нагрузка на ТН: **{total_load:.2f} В·А**")
+            
+            if is_overload:
+                st.error(f"ПЕРЕГРУЗКА! Номинальная мощность: {w['rated_power']} В·А")
+                # Предложение по оптимизации
+                opt = suggest_optimization(w["S_ab"], w["S_bc"], w["S_ca"], w["S_phi"], w["scheme"], w["rated_power"])
+                if opt:
+                    st.info(f"💡 Рекомендация: перераспределите нагрузку. Например, перенесите нагрузку с наименее загруженной фазы: "
+                            f"S_ab={opt['new_ab']:.2f}, S_bc={opt['new_bc']:.2f}, S_ca={opt['new_ca']:.2f} В·А. "
+                            f"Тогда расчётная нагрузка составит {opt['new_total']:.2f} В·А.")
+                else:
+                    st.warning("Перераспределение не поможет. Требуется замена ТН на более мощный или подключение дополнительного ТН.")
+            else:
+                st.success(f"Нагрузка в пределах нормы (≤ {w['rated_power']} В·А).")
+                
+            results.append({
+                **w, "S_nf": S_nf, "total_load": total_load
+            })
+        st.session_state.calc_results = results
 
 # ============================================================
 # ВКЛАДКА 2: ПОТЕРИ НАПРЯЖЕНИЯ
 # ============================================================
 with tab2:
-    st.header("2. Расчёт потерь напряжения во вторичных цепях")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        length = st.number_input("Длина кабеля, м", value=30.0, min_value=1.0)
-        cross_section = st.number_input("Сечение жилы, мм²", value=2.5, min_value=0.5)
-    with col2:
-        material = st.selectbox("Материал жилы", ["Медь (57)", "Алюминий (34.5)"])
-        mode = st.radio("Режим цепи", ["3-фазная (K=√3)", "2-проводная (K=2)"])
-    with col3:
-        S_load = st.number_input(
-            "Нагрузка Sнф, В·А (из вкладки 1)",
-            value=float(S_nf) if 'S_nf' in dir() else 100.0,
-        )
-
-    mat_key = "copper" if "Медь" in material else "aluminum"
-    mode_key = "3phase" if "3-фазная" in mode else "2wire"
-
-    r = calculate_resistance(length, cross_section, mat_key)
-    I = calculate_current(S_load, mode_key)
-    dU = calculate_du(I, r, mode_key)
-
-    st.write("---")
-    st.subheader("Результаты расчёта")
-    st.write(f"Сопротивление жилы: **{r:.3f} Ом** (формула 6)")
-    st.write(f"Ток нагрузки: **{I:.2f} А**")
-    st.metric("Потери напряжения (ΔU)", f"{dU:.3f} В (= {dU:.3f} %)")
-
-    st.subheader("Проверка допустимых потерь (п. 1.4 РД)")
-    st.write("Согласно РД 34.35.305-79, допустимые потери:")
-    st.markdown(
-        "- до расчетных счетчиков межсистемных линий: **0.25%**\n"
-        "- до других расчетных счетчиков: **0.5%**\n"
-        "- до щитовых приборов: **1.5%**\n"
-        "- до ФИП: **2%**\n"
-        "- до реле защиты и автоматики: **3%**"
-    )
-
-    target = st.selectbox(
-        "Выберите назначение цепи для проверки:",
-        [
-            "0.25% (межсистемные счетчики)",
-            "0.5% (счетчики)",
-            "1.5% (щитовые приборы)",
-            "2% (ФИП)",
-            "3% (реле защиты)",
-        ],
-    )
-    limit = float(target.split("%")[0])
-
-    if dU <= limit:
-        st.success(f"Условие выполняется: {dU:.3f}% ≤ {limit}%")
+    st.header("2. Расчёт потерь напряжения")
+    
+    if "calc_results" not in st.session_state:
+        st.warning("Сначала выполните расчёт нагрузок на вкладке 1.")
     else:
-        st.error(
-            f"Условие НЕ выполняется: {dU:.3f}% > {limit}%. "
-            "Требуется увеличить сечение кабеля или разгрузить цепь."
-        )
+        with st.form("voltage_form"):
+            for i, w in enumerate(st.session_state.calc_results):
+                st.subheader(f"Обмотка {i+1} ({w['scheme_name']})")
+                c1, c2, c3 = st.columns(3)
+                length = c1.number_input(f"Длина кабеля, м (Обмотка {i+1})", value=30.0, min_value=1.0, step=1.0, key=f"len_{i}")
+                cross_section = c2.number_input(f"Сечение жилы, мм² (Обмотка {i+1})", value=2.5, min_value=0.5, step=0.5, format="%.1f", key=f"cs_{i}")
+                material = c3.selectbox(f"Материал жилы (Обмотка {i+1})", ["Медь", "Алюминий"], key=f"mat_{i}")
+                
+                # Сохраняем параметры кабеля в сессию для отчёта
+                if "cable_params" not in st.session_state:
+                    st.session_state.cable_params = {}
+                st.session_state.cable_params[i] = {"length": length, "cs": cross_section, "mat": material}
+
+            sub_v = st.form_submit_button("Рассчитать потери")
+
+        if sub_v or "voltage_results" in st.session_state:
+            st.write("---")
+            st.subheader("Результаты расчёта")
+            v_results = []
+            
+            for i, w in enumerate(st.session_state.calc_results):
+                params = st.session_state.cable_params[i]
+                mat_key = "copper" if params["mat"] == "Медь" else "aluminum"
+                
+                r = calculate_resistance(params["length"], params["cs"], mat_key)
+                I = calculate_current(w["S_nf"], w["scheme"])
+                du = calculate_du(I, r, w["scheme"])
+                
+                st.markdown(f"**Обмотка {i+1}**")
+                st.write(f"Сопротивление: {r:.4f} Ом | Ток: {I:.4f} А | Потери: **{du:.4f} В (= {du:.4f} %)**")
+                
+                v_results.append({**w, **params, "r": r, "I": I, "du": du})
+                
+            st.session_state.voltage_results = v_results
 
 # ============================================================
 # ВКЛАДКА 3: ПРОВЕРКА АВТОМАТОВ
 # ============================================================
 with tab3:
     st.header("3. Проверка автоматических выключателей")
-    st.info("В разработке. Здесь будут учтены характеристики АП50 и KEAZ OptiDin BM63.")
+    
+    with st.form("breaker_form"):
+        st.subheader("Параметры ТН и вторичной цепи")
+        c1, c2, c3 = st.columns(3)
+        uk = c1.number_input("Напряжение КЗ (Uк), %", value=6.0, step=0.1, format="%.2f")
+        u_nom = c2.number_input("Номинальное напряжение обмотки, В", value=100.0)
+        s_nom = c3.number_input("Номинальная мощность ТН (для расчета Zк), В·А", value=400.0, step=50.0)
+        
+        st.write("Сопротивление проводов до автомата (Ом):")
+        c4, c5 = st.columns(2)
+        r_phase = c4.number_input("Фазный провод (r_пр)", value=0.05, step=0.01, format="%.3f")
+        r_zero = c5.number_input("Нулевой провод (r_0пр)", value=0.05, step=0.01, format="%.3f")
+        
+        st.subheader("Параметры автомата")
+        c6, c7, c8 = st.columns(3)
+        breaker_type = c6.selectbox("Тип автомата", ["AP50", "KEAZ OptiDin BM63"])
+        I_nom = c7.number_input("Номинальный ток автомата, А", value=6.3, step=0.1, format="%.2f")
+        
+        characteristic = None
+        if breaker_type == "KEAZ OptiDin BM63":
+            characteristic = c8.selectbox("Характеристика", ["B", "C", "D", "Z", "L", "K"])
 
-    breaker_type = st.selectbox(
-        "Тип автомата", ["АП50 (старый)", "KEAZ OptiDin BM63"]
-    )
-    I_kz = st.number_input("Минимальный ток КЗ, А", value=50.0)
-    I_nom = st.number_input("Номинальный ток расцепителя, А", value=6.3)
+        sub_b = st.form_submit_button("Проверить автомат")
 
-    if breaker_type.startswith("АП50"):
-        st.write("Согласно РД, для АП50 ток срабатывания отсечки принимается 4·Iном.")
-        K_ch = I_kz / (4 * I_nom)
-    else:
-        char = st.selectbox("Характеристика KEAZ", ["B", "C", "D"])
-        mult = {"B": 5, "C": 10, "D": 20}[char]
-        K_ch = I_kz / (mult * I_nom)
+    if sub_b or "breaker_results" in st.session_state:
+        st.write("---")
+        st.subheader("Результаты проверки")
+        
+        zk = calculate_zk(uk, u_nom, s_nom)
+        st.write(f"Сопротивление ТН (Zк): **{zk:.4f} Ом**")
+        
+        # Расчет минимального тока КЗ (для 3-фазной цепи по формулам П.12/П.13)
+        # Используем U_мф = 100 В для основных обмоток
+        Ikz_2 = calculate_ikz_min(100.0, zk, r_phase) # Двухфазное
+        Ikz_1 = calculate_ikz_min(100.0, zk, r_phase, r_zero) # Однофазное
+        
+        st.write(f"Минимальный ток КЗ (2-фазный): **{Ikz_2:.2f} А**")
+        st.write(f"Минимальный ток КЗ (1-фазный): **{Ikz_1:.2f} А**")
+        
+        # Для проверки берем меньший из токов
+        Ikz_min = min(Ikz_2, Ikz_1)
+        
+        K_ch, success = check_breaker(Ikz_min, I_nom, breaker_type, characteristic)
+        
+        st.write(f"Коэффициент чувствительности Kч: **{K_ch:.2f}**")
+        if success:
+            st.success("Условие Kч ≥ 1.5 выполняется. Автомат выбран верно.")
+        else:
+            st.error("Условие Kч ≥ 1.5 НЕ выполняется. Требуется автомат с меньшим номиналом или увеличение сечения кабеля.")
+            
+        st.session_state.breaker_results = {
+            "zk": zk, "Ikz_2": Ikz_2, "Ikz_1": Ikz_1, "Ikz": Ikz_min,
+            "type": breaker_type, "I_nom": I_nom, "char": characteristic,
+            "K_ch": K_ch, "success": success
+        }
 
-    st.write(f"Коэффициент чувствительности Kч = **{K_ch:.2f}**")
-    if K_ch >= 1.5:
-        st.success("Kч ≥ 1.5 (Условие выполняется)")
-    else:
-        st.error("Kч < 1.5 (Условие не выполняется)")
+# ============================================================
+# ГЕНЕРАЦИЯ ОТЧЁТА (Кнопка внизу страницы)
+# ============================================================
+st.write("---")
+st.header("4. Формирование отчёта")
+
+if "calc_results" in st.session_state and "voltage_results" in st.session_state and "breaker_results" in st.session_state:
+    if st.button("Скачать отчёт в Word (.docx)"):
+        # Подготовка данных для отчёта
+        report_data = {
+            "windings": [],
+            "breaker": st.session_state.breaker_results
+        }
+        
+        for i, w in enumerate(st.session_state.voltage_results):
+            report_data["windings"].append({
+                "scheme_name": w["scheme_name"],
+                "S_ab": w["S_ab"], "S_bc": w["S_bc"], "S_ca": w["S_ca"], "S_phi": w["S_phi"],
+                "S_nf": w["S_nf"], "total_load": w["total_load"], "rated_power": w["rated_power"],
+                "r": w["r"], "I": w["I"], "du": w["du"]
+            })
+            
+        buf = build_report(report_data)
+        st.download_button(
+            label="Нажмите здесь, если скачивание не началось автоматически",
+            data=buf,
+            file_name="TN_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+else:
+    st.info("Для формирования отчёта выполните расчёты на всех трёх вкладках.")
