@@ -23,9 +23,10 @@ def calculate_snf_open_delta(S_ab, S_bc, S_ca):
     """
     loads = sorted([S_ab, S_bc, S_ca], reverse=True)
     S1, S2 = loads[0], loads[1]
-    
+
     if S2 == 0:
+        # Если есть только одна междуфазная нагрузка — она вся ложится на ТН
         return S1
-        
+
     K = S1 / S2
     return S2 * math.sqrt(K**2 + K + 1)
