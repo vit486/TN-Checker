@@ -72,9 +72,16 @@ with tab1:
                     **({"S_ф": st.column_config.NumberColumn("S_ф (В·А)", min_value=0.0, step=0.01, format="%.5f")} if show_phi else {}),
                 },
             )
-            # Сливаем видимые колонки обратно, остальные (скрытые) не трогаем
-            stored[visible] = edited[visible].values
-            st.session_state[f"df_{i}"] = stored
+            # Пересборка stored: берём все колонки из edited, недостающие (скрытые) — из старого stored
+            new_df = edited.copy()
+            for hidden in ALL_COLS:
+                if hidden not in new_df.columns:
+                    if hidden in stored.columns:
+                        new_df[hidden] = stored[hidden].reindex(new_df.index).fillna(0.0).values
+                    else:
+                        new_df[hidden] = 0.0
+            new_df = new_df[ALL_COLS]
+            st.session_state[f"df_{i}"] = new_df
 
             def _sum(col):
                 if col not in edited.columns: return 0.0
